@@ -1,0 +1,7 @@
+# OKX 量化交易依赖
+requests>=2.28.0
+ccxt>=4.0.0
+pandas>=2.0.0
+numpy>=1.24.0
+websockets>=10.0
+python-dotenv>=1.0.0
