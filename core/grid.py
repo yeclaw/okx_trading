@@ -1062,12 +1062,20 @@ class GridManager:
             # [修复] suspect 标记检查需要优先处理
             # 如果 suspect=True，先检查订单是否真的存在
             if info.get('suspect'):
-                # 如果 suspect=True 且 order_id 不存在，说明是之前订单不存在的残留状态
-                # 直接清除 suspect 并跳过（不需要重新挂单，因为没有 order_id）
+                # [Bug5修复 2026-03-16] suspect=True 且 order_id 不存在时
+                # 需要区分是否已成交，避免遗漏补单
                 if not info.get('order_id'):
-                    info['suspect'] = False
-                    self.logger.info(f"[sync_orders] suspect订单无order_id，清除suspect标记")
-                    continue
+                    if info.get('done'):
+                        # 已成交但 order_id 被清除（可能是成交后状态同步问题）
+                        # 清除 suspect，保持 done，触发补单流程
+                        info['suspect'] = False
+                        self.logger.info(f"[sync_orders] suspect订单已成交(done=True)，清除suspect触发补单")
+                        # 不 continue，继续处理补单
+                    else:
+                        # 未成交，清除 suspect 并跳过（不需要重新挂单）
+                        info['suspect'] = False
+                        self.logger.info(f"[sync_orders] suspect订单未成交，清除suspect标记")
+                        continue
                 else:
                     try:
                         if self.exchange:

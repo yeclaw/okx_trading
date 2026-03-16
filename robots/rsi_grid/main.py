@@ -795,10 +795,10 @@ class QuantTradingSystem:
             if balance and 'data' in balance:
                 for item in balance['data'][0].get('details', []):
                     if item.get('ccy') == base_currency:
-                        # [修复 2026-03-01] 使用 frozenBal + availBal 总和，避免竞态条件
+                        # [Bug2修复 2026-03-16] 只使用 availBal，不加 frozenBal
+                        # 撤单是异步的，frozenBal 需要时间解冻，直接加会导致 Insufficient balance
                         actual_balance = float(item.get('availBal', 0))
                         frozen_balance = float(item.get('frozenBal', 0))
-                        actual_balance = actual_balance + frozen_balance
                         break
 
             # 取记录持仓量 和 实际可用余额 的较小值
@@ -817,8 +817,14 @@ class QuantTradingSystem:
                 usdt_back = amount * current_price
                 self.capital += usdt_back
 
+                # [Bug1修复 2026-03-16] PnL 计算需要加上已实现的盈亏
+                # 网格卖出成交时更新了 grid_state 中的 realized_pnl，但没有同步到 batches
+                grid_state = self.grid_manager.grid_state.get(symbol, {})
+                realized_pnl = grid_state.get('realized_pnl', 0)
+                
                 total_cost = sum(b.cost for b in pos.batches)
-                pnl = usdt_back - total_cost
+                # 已实现盈亏 + 卖出剩余持仓的收益 - 总成本
+                pnl = realized_pnl + usdt_back - total_cost
                 pnl_pct = (pnl / total_cost) * 100 if total_cost > 0 else 0
 
                 self.position_mgr.close_position(symbol, reason)
@@ -893,11 +899,11 @@ class QuantTradingSystem:
             
             # 只有持仓超过 10 分钟才检测手动平仓（避免网格操作时的误判）
             if position_age_seconds > 600:  # 10 分钟 = 600 秒
-                if real_balance > 0:
-                    balance_value = real_balance * pos.avg_price
-                    position_value = pos.total_amount * pos.avg_price
-                    # [修复 2026-03-01] 放宽阈值：余额价值 < 持仓价值 1% 才判定手动平仓
-                    if position_value > 10 and balance_value < position_value * 0.01:
+                # [Bug3修复 2026-03-16] 检测余额是否大幅减少（包含 100% 卖空场景）
+                # 原来用 real_balance > 0 导致 100% 卖空时漏检
+                balance_value = real_balance * pos.avg_price
+                position_value = pos.total_amount * pos.avg_price
+                if position_value > 10 and balance_value < position_value * 0.01:
                         logger.warning(f"⚠️ 检测到 {symbol} 手动平仓 (记录持仓:{pos.total_amount:.4f}, 余额:{real_balance:.4f}, 价值:${balance_value:.2f})")
                         try:
                             # 撤销所有网格订单
