@@ -902,19 +902,10 @@ class GridManager:
                 self.logger.warning(f"[方向调整] {symbol} 检测到方向重叠! 最低买价={min_buy:.2e}, 最高卖价={max_sell:.2e}")
                 adjusted = True
         
-        # 2. 检查低价卖问题（卖单价位低于当前市场价格，应该买而不是卖）
-        for p_str, info in pending.items():
-            if info.get('order_id') or info.get('done'):
-                continue
-            
-            p = parse_price(p_str)
-            side = info.get('side', '')
-            
-            # 如果卖单价位低于当前市场价，说明挂错了（应该买）
-            if side == 'sell' and p < current_price:
-                self.logger.warning(f"[方向调整] {symbol} 检测到低价卖! {p_str}(卖) < 当前价${current_price:.2e}，改为买单")
-                info['side'] = 'buy'
-                adjusted = True
+        # [Medium Bug修复 2026-03-17] 移除低价卖翻转逻辑
+        # 原逻辑：如果卖单价位低于当前市场价，强制翻转成买单
+        # 风险：价格瞬间暴涨时不应追高买入，会增加单向敞口风险
+        # 正确做法：让卖单被成交或等待自然撤销，不主动翻转方向
         
         if adjusted:
             self.save_state()
@@ -1756,9 +1747,11 @@ class GridManager:
                     old_price = state.get('avg_price', state.get('entry_price', 0))
                     
                     if old_size > 0:
+                        # [Bug修复] 买入时扣除手续费，与 PositionManager 保持一致
+                        actual_amount = filled_amount * (1 - FEE_RATE)
                         # 加权平均计算新均价
-                        new_size = old_size + filled_amount
-                        new_avg = (old_price * old_size + float(p_str) * filled_amount) / new_size
+                        new_size = old_size + actual_amount
+                        new_avg = (old_price * old_size + float(p_str) * actual_amount) / new_size
                         # [修复] 更新 avg_price 而不是 entry_price
                         state['avg_price'] = new_avg
                         state['position_size'] = new_size
