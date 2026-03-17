@@ -768,14 +768,22 @@ class QuantTradingSystem:
             self.grid_manager.cancel_all_grid_orders(symbol, delete_state=False)
             logger.info(f"已发送撤单请求 {symbol}")
 
-            # === [修复] 循环确认挂单已撤销 ===
+            # === [Medium Bug修复 2026-03-17] 只检查机器人自己的挂单 ===
+            # 原逻辑：fetch_open_orders 返回所有挂单，可能被用户手动单干扰
+            # 修复：只检查 grid_manager .pending 中是否有活跃挂单
             max_retries = 5
             for i in range(max_retries):
-                open_orders = self.exchange.fetch_open_orders(symbol)
-                if not open_orders:
-                    logger.info(f"确认 {symbol} 无活动挂单")
+                # 只检查机器人自己的挂单状态
+                grid_state = self.grid_manager.grid_state.get(symbol, {})
+                pending = grid_state.get('pending', {})
+                active_orders = [p for p, info in pending.items() 
+                               if info.get('order_id') and not info.get('done')]
+                
+                if not active_orders:
+                    logger.info(f"确认 {symbol} 机器人无活动挂单")
                     break
-                logger.info(f"等待 {symbol} 撤单中... 剩余 {len(open_orders)} 个挂单")
+                    
+                logger.info(f"等待 {symbol} 撤单中... 剩余 {len(active_orders)} 个网格挂单")
                 time.sleep(1)
                 # 如果是最后一次尝试还不行，再次强制撤单
                 if i == max_retries - 2:
@@ -804,10 +812,42 @@ class QuantTradingSystem:
             # 取记录持仓量 和 实际可用余额 的较小值
             amount = min(pos.total_amount, actual_balance)
 
+            # [Bug2修复 2026-03-17] 网格全卖光时的处理
+            # 如果 amount <= 0，说明持仓已通过网格全部卖出，此时应提取 realized_pnl 作为最终盈利
             if amount <= 0:
-                logger.warning(f"平仓失败 {symbol}: 可用余额为 0 (记录: {pos.total_amount})")
-                self.position_mgr.close_position(symbol, f"{reason} (余额不足手动平仓)")
-                return
+                if pos.total_amount > 0:
+                    # 持仓记录还有，但交易所余额为0（可能刚卖完，还在冻结中）
+                    logger.warning(f"平仓 {symbol}: 持仓 {pos.total_amount} 但可用余额 0，等待解冻后重试")
+                    # 不直接返回，给一点时间让冻结资金解冻
+                    time.sleep(2)
+                    # 再次尝试获取余额
+                    balance = self.exchange.fetch_balance()
+                    if balance and 'data' in balance:
+                        for item in balance['data'][0].get('details', []):
+                            if item.get('ccy') == base_currency:
+                                actual_balance = float(item.get('availBal', 0))
+                                amount = min(pos.total_amount, actual_balance)
+                                break
+                
+                # 仍然为 0，说明确实卖光了（网格大获全胜！）
+                if amount <= 0:
+                    grid_state = self.grid_manager.grid_state.get(symbol, {})
+                    realized_pnl = grid_state.get('realized_pnl', 0)
+                    total_cost = sum(b.cost for b in pos.batches)
+                    
+                    logger.info(f"网格全卖光 {symbol}: 累计盈利 ${realized_pnl:.2f} (本金 ${total_cost})")
+                    self.logger.log_sell(
+                        symbol=symbol,
+                        price=current_price,
+                        amount=0,  # 已全部通过网格卖出
+                        pnl_pct=(realized_pnl / total_cost * 100) if total_cost > 0 else 0,
+                        pnl_usd=realized_pnl,
+                        holding_seconds=None,
+                        reason=f"{reason} (网格全卖)"
+                    )
+                    self.position_mgr.close_position(symbol, reason)
+                    self.grid_manager.cancel_all_grid_orders(symbol, delete_state=True)
+                    return
 
             logger.info(f"执行平仓 {symbol}: 计划 {pos.total_amount}, 实际可用 {actual_balance}, 下单 {amount}")
 
@@ -817,15 +857,22 @@ class QuantTradingSystem:
                 usdt_back = amount * current_price
                 self.capital += usdt_back
 
-                # [Bug1修复 2026-03-16] PnL 计算需要加上已实现的盈亏
-                # 网格卖出成交时更新了 grid_state 中的 realized_pnl，但没有同步到 batches
+                # [Bug1修复 2026-03-17] PnL 计算修正
+                # 原公式: pnl = realized_pnl + usdt_back - total_cost (错误：total_cost 是总建仓成本)
+                # 正确公式: PnL = realized_pnl + (usdt_back - 余量持仓成本)
+                # - realized_pnl: 网格历史卖出的净利润
+                # - usdt_back: 最后一次平仓收回的资金
+                # - amount * pos.avg_price: 最后这部分仓位的成本
                 grid_state = self.grid_manager.grid_state.get(symbol, {})
                 realized_pnl = grid_state.get('realized_pnl', 0)
                 
-                total_cost = sum(b.cost for b in pos.batches)
-                # 已实现盈亏 + 卖出剩余持仓的收益 - 总成本
-                pnl = realized_pnl + usdt_back - total_cost
-                pnl_pct = (pnl / total_cost) * 100 if total_cost > 0 else 0
+                # 最后一次交易的盈亏 = 卖出回笼资金 - 这部分仓位的持仓成本
+                final_trade_pnl = usdt_back - (amount * pos.avg_price)
+                pnl = realized_pnl + final_trade_pnl
+                
+                # 计算 PnL 百分比（使用实际平仓出场的资金作为分母）
+                total_invested = sum(b.cost for b in pos.batches)
+                pnl_pct = (pnl / total_invested) * 100 if total_invested > 0 else 0
 
                 self.position_mgr.close_position(symbol, reason)
                 
@@ -1157,13 +1204,16 @@ class QuantTradingSystem:
                         if order['side'] == 'buy':
                             # 买入：实际到账 = 成交数量 × (1 - 手续费)
                             actual_amount = filled_amount * (1 - fee_rate)
-                            pos.total_amount += actual_amount
-                            # 同时更新均价
+                            # [Bug3修复 2026-03-17] 先计算新均价，再更新总量
+                            # 原错误顺序：先加总量再算均价，导致计算错误
                             if pos.avg_price > 0:
-                                pos.avg_price = (pos.avg_price * pos.total_amount + order['price'] * actual_amount) / (pos.total_amount + actual_amount)
+                                new_total = pos.total_amount + actual_amount
+                                pos.avg_price = (pos.avg_price * pos.total_amount + order['price'] * actual_amount) / new_total
+                                pos.total_amount = new_total
                             else:
                                 pos.avg_price = order['price']
-                            logger.info(f"网格买入更新持仓: +{actual_amount:.4f} {symbol.split('/')[0]} (扣{fee_rate*100}%手续费)")
+                                pos.total_amount = actual_amount
+                            logger.info(f"网格买入更新持仓: +{actual_amount:.4f} {symbol.split('/')[0]} (扣{fee_rate*100}%手续费, 均价 ${pos.avg_price:.4f})")
                         elif order['side'] == 'sell':
                             # 卖出前检查持仓，防止超卖导致负数
                             actual_sell = min(filled_amount, pos.total_amount)
