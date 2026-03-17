@@ -1880,7 +1880,8 @@ class GridManager:
         
         # 1. 取消所有活跃挂单
         # [Bug4修复 2026-03-17] 检查订单不存在错误，可能已成交
-        lost_fills = []  # 记录可能丢失的成交事件
+        # 注意：这里只记录警告，不强行恢复持仓
+        # 原因：main.py 的 check_positions 中有交易所同步逻辑，会自动矫正持仓
         
         for p_str, info in pending.items():
             order_id = info.get('order_id')
@@ -1894,44 +1895,8 @@ class GridManager:
                     err_msg = str(e).lower()
                     if '51603' in err_msg or '51016' in err_msg or 'order not found' in err_msg or 'does not exist' in err_msg:
                         self.logger.warning(f"[价格偏离] 订单不存在，可能已成交或被撤销: {order_id}")
-                        # [Bug4修复] 记录可能丢失的成交，后续处理
-                        if info.get('fill_count', 0) > 0:
-                            lost_fills.append({
-                                'price_str': p_str,
-                                'side': info.get('side'),
-                                'filled_amount': info.get('last_filled_amount', 0)
-                            })
                     else:
                         self.logger.error(f"[价格偏离] 撤销订单失败 {symbol}: {e}")
-        
-        # [Bug4修复] 处理可能丢失的成交事件
-        if lost_fills:
-            self.logger.warning(f"[价格偏离] 检测到 {len(lost_fills)} 个可能丢失的成交事件，需要恢复持仓")
-            for fill in lost_fills:
-                p_str = fill['price_str']
-                side = fill['side']
-                filled_amount = fill.get('filled_amount', 0)
-                
-                if side == 'buy' and filled_amount > 0:
-                    # 买单成交：更新持仓
-                    old_size = state.get('position_size', 0)
-                    actual_amount = filled_amount * (1 - FEE_RATE)
-                    new_size = old_size + actual_amount
-                    state['position_size'] = new_size
-                    # 更新均价
-                    old_price = state.get('avg_price', state.get('entry_price', 0))
-                    if old_size > 0:
-                        new_avg = (old_price * old_size + float(p_str) * actual_amount) / new_size
-                        state['avg_price'] = new_avg
-                    else:
-                        state['avg_price'] = float(p_str)
-                    self.logger.info(f"[价格偏离] 恢复买入持仓: {symbol} @ {p_str}, +{actual_amount:.4f}")
-                elif side == 'sell' and filled_amount > 0:
-                    # 卖单成交：减少持仓
-                    old_size = state.get('position_size', 0)
-                    actual_sell = min(filled_amount, old_size)
-                    state['position_size'] = max(0, old_size - actual_sell)
-                    self.logger.info(f"[价格偏离] 恢复卖出记录: {symbol} @ {p_str}, -{actual_sell:.4f}")
         
         # 2. [关键修复] 使用 init_grid 重新生成所有数据结构 (pending, prices 等)
         # 保存关键状态，防止持仓数据丢失

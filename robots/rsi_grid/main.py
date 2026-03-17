@@ -812,42 +812,33 @@ class QuantTradingSystem:
             # 取记录持仓量 和 实际可用余额 的较小值
             amount = min(pos.total_amount, actual_balance)
 
-            # [Bug2修复 2026-03-17] 网格全卖光时的处理
-            # 如果 amount <= 0，说明持仓已通过网格全部卖出，此时应提取 realized_pnl 作为最终盈利
-            if amount <= 0:
-                if pos.total_amount > 0:
-                    # 持仓记录还有，但交易所余额为0（可能刚卖完，还在冻结中）
-                    logger.warning(f"平仓 {symbol}: 持仓 {pos.total_amount} 但可用余额 0，等待解冻后重试")
-                    # 不直接返回，给一点时间让冻结资金解冻
-                    time.sleep(2)
-                    # 再次尝试获取余额
-                    balance = self.exchange.fetch_balance()
-                    if balance and 'data' in balance:
-                        for item in balance['data'][0].get('details', []):
-                            if item.get('ccy') == base_currency:
-                                actual_balance = float(item.get('availBal', 0))
-                                amount = min(pos.total_amount, actual_balance)
-                                break
+            # [Bug修复 2026-03-17] 真正的"完美胜利"判断
+            # 必须基于系统本地账本 pos.total_amount，而不是 amount（可能被冻结）
+            if pos.total_amount <= 1e-6:
+                # 系统账本已归零，说明网格确实全卖光了
+                grid_state = self.grid_manager.grid_state.get(symbol, {})
+                realized_pnl = grid_state.get('realized_pnl', 0)
+                total_cost = sum(b.cost for b in pos.batches)
                 
-                # 仍然为 0，说明确实卖光了（网格大获全胜！）
-                if amount <= 0:
-                    grid_state = self.grid_manager.grid_state.get(symbol, {})
-                    realized_pnl = grid_state.get('realized_pnl', 0)
-                    total_cost = sum(b.cost for b in pos.batches)
-                    
-                    logger.info(f"网格全卖光 {symbol}: 累计盈利 ${realized_pnl:.2f} (本金 ${total_cost})")
-                    self.logger.log_sell(
-                        symbol=symbol,
-                        price=current_price,
-                        amount=0,  # 已全部通过网格卖出
-                        pnl_pct=(realized_pnl / total_cost * 100) if total_cost > 0 else 0,
-                        pnl_usd=realized_pnl,
-                        holding_seconds=None,
-                        reason=f"{reason} (网格全卖)"
-                    )
-                    self.position_mgr.close_position(symbol, reason)
-                    self.grid_manager.cancel_all_grid_orders(symbol, delete_state=True)
-                    return
+                logger.info(f"网格全卖光 {symbol}: 累计盈利 ${realized_pnl:.2f} (本金 ${total_cost})")
+                self.logger.log_sell(
+                    symbol=symbol,
+                    price=current_price,
+                    amount=0,  # 已全部通过网格卖出
+                    pnl_pct=(realized_pnl / total_cost * 100) if total_cost > 0 else 0,
+                    pnl_usd=realized_pnl,
+                    holding_seconds=None,
+                    reason=f"{reason} (网格全卖)"
+                )
+                self.position_mgr.close_position(symbol, reason)
+                self.grid_manager.cancel_all_grid_orders(symbol, delete_state=True)
+                return
+            
+            # 系统账本还有持仓，但可用余额为0（可能是冻结状态或刚手动卖出）
+            # 绝不能在这里 close_position！必须等下次循环
+            if amount <= 0:
+                logger.warning(f"平仓 {symbol}: 持仓还有 {pos.total_amount:.4f} 但可用余额 0，等待解冻后重试")
+                return
 
             logger.info(f"执行平仓 {symbol}: 计划 {pos.total_amount}, 实际可用 {actual_balance}, 下单 {amount}")
 
